@@ -1,0 +1,41 @@
+# ── Credentials — NEVER commit these ──────────────────────────────────────
+*.json
+!requirements*.json     # allow any json that isn't a key file
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Runtime output (generated each run) ──────────────────────────────────
+output/
+logs/
+*.pdf
+*.csv
+*.png
+
+# ── Virtual environments ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── OS / editor ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── Environment files ─────────────────────────────────────────────────────
+.env
+.env.local
+.env.*

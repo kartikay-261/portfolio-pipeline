@@ -1,0 +1,82 @@
+name: Portfolio Pipeline
+
+on:
+  # ── Scheduled trigger: every 30 minutes ───────────────────────────────────
+  # GitHub cron uses UTC. Minimum granularity is 5 minutes.
+  # Note: during periods of high GitHub load, runs may be delayed up to
+  # 15 minutes — acceptable for a financial reporting pipeline.
+  schedule:
+    - cron: "0,30 * * * *"   # at :00 and :30 of every hour, every day
+
+  # ── Manual trigger: run instantly from the Actions tab ────────────────────
+  workflow_dispatch:
+    inputs:
+      run_note:
+        description: "Optional note for this manual run"
+        required: false
+        default: "Manual trigger"
+
+# Only allow one run at a time — if the previous run is still going,
+# cancel it rather than queue a second (avoids Drive write conflicts).
+concurrency:
+  group: portfolio-pipeline
+  cancel-in-progress: true
+
+jobs:
+  run-portfolio-analysis:
+    name: Run Portfolio Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 25    # kill job if it hangs; keeps it inside the 30-min window
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"              # caches pip downloads between runs
+
+      # ── 3. Install dependencies ───────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run the pipeline (single execution) ────────────────────────────────
+      # GitHub Actions IS the scheduler — we pass --run-once so the script
+      # executes once and exits cleanly. The cron above handles repetition.
+      - name: Run portfolio analysis
+        env:
+          # Drive credentials — stored as GitHub Secrets, never in code
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID:            ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          python src/portfolio_runner.py \
+            --run-once \
+            --output-dir ./output \
+            --log-dir    ./logs
+
+      # ── 5. Upload artifacts to GitHub (backup + debugging) ────────────────────
+      # Keeps the last 7 days of reports accessible in the Actions tab.
+      - name: Upload PDF report as GitHub artifact
+        if: always()    # upload even if the run failed (for debugging logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolio-report-${{ github.run_number }}
+          path: |
+            output/*.pdf
+            output/*.json
+            logs/*.log
+          retention-days: 7
+
+      # ── 6. Notify on failure (optional — add your webhook/email) ─────────────
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Pipeline failed at $(date -u). Check the Actions log."
+          # Add a curl call to Slack/email webhook here if needed:
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"Portfolio pipeline failed!"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
