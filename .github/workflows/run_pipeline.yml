@@ -47,12 +47,16 @@ jobs:
       # ── 4. Run the pipeline (single execution) ────────────────────────────────
       # GitHub Actions IS the scheduler — we pass --run-once so the script
       # executes once and exits cleanly. The cron above handles repetition.
+      #
+      # sleep 10: lets the runner network stack fully initialise before
+      # hitting Yahoo Finance — reduces empty-response failures on fresh runners.
       - name: Run portfolio analysis
         env:
-          # Drive credentials — stored as GitHub Secrets, never in code
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
           GDRIVE_FOLDER_ID:            ${{ secrets.GDRIVE_FOLDER_ID }}
+          YF_CACHE_DISABLED: "1"
         run: |
+          sleep 10
           python src/portfolio_runner.py \
             --run-once \
             --output-dir ./output \

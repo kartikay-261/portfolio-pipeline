@@ -120,44 +120,97 @@ class YFinanceClient:
     """
     Thin, cached wrapper around yfinance.
 
-    Each ticker's full history and sector are fetched once per PortfolioAnalyser
-    instance (i.e. once per 30-minute run), avoiding redundant network calls.
+    Uses a persistent requests.Session with a real browser User-Agent so
+    Yahoo Finance does not block requests from CI/datacenter IP ranges
+    (GitHub Actions runners are on Azure IPs that YF rate-limits heavily
+    when the default Python/yfinance UA is used).
+
+    Each ticker's full history and sector are fetched once per run via the
+    cache — redundant HTTP calls are eliminated automatically.
     """
+
+    # A real browser UA is the single most reliable fix for YF blocking in CI.
+    # Rotate this string if blocking resumes.
+    _USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    _MAX_RETRIES = 3          # retry attempts per ticker on empty response
+    _RETRY_DELAY = 5          # seconds to wait between retries
 
     def __init__(self, logger: logging.Logger):
         self._history_cache: dict[str, pd.Series] = {}
         self._sector_cache:  dict[str, str]       = {}
-        self.log = logger
+        self.log     = logger
+        self._session = self._build_session()
+
+    def _build_session(self):
+        """
+        Create a requests.Session with browser headers and mount it into
+        yfinance so every HTTP call uses the same session automatically.
+        """
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent":      self._USER_AGENT,
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection":      "keep-alive",
+        })
+        return session
 
     def clear_cache(self):
         """Call at the start of each run so fresh data is fetched."""
         self._history_cache.clear()
         self._sector_cache.clear()
+        # Rebuild session to clear any stale cookies
+        self._session = self._build_session()
 
     def fetch_history(self, ticker: str, start: str = "2020-01-01") -> pd.Series:
         """
         Download full daily adjusted-close history for *ticker*.
-        Uses ticker.history() — the recommended method from the YF API guide.
+        Uses ticker.history() with a browser session and exponential backoff.
         Returns pd.Series indexed by 'YYYY-MM-DD' date strings.
         """
         ticker = ticker.upper()
         if ticker in self._history_cache:
             return self._history_cache[ticker]
 
-        self.log.debug("Fetching history for %s from Yahoo Finance…", ticker)
-        try:
-            df = yf.Ticker(ticker).history(
-                start=start, end=None, interval="1d", auto_adjust=True
-            )
-            if df.empty:
-                self.log.warning("No data returned for %s.", ticker)
-                series = pd.Series(dtype=float)
-            else:
-                series = df["Close"].copy()
-                series.index = pd.to_datetime(series.index).strftime("%Y-%m-%d")
-        except Exception as exc:
-            self.log.error("Error fetching history for %s: %s", ticker, exc)
-            series = pd.Series(dtype=float)
+        self.log.debug("Fetching history for %s from Yahoo Finance...", ticker)
+        series = pd.Series(dtype=float)
+
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            try:
+                t  = yf.Ticker(ticker, session=self._session)
+                df = t.history(
+                    start=start, end=None, interval="1d", auto_adjust=True
+                )
+                if df.empty:
+                    self.log.warning(
+                        "No data returned for %s (attempt %d/%d).",
+                        ticker, attempt, self._MAX_RETRIES,
+                    )
+                    if attempt < self._MAX_RETRIES:
+                        time.sleep(self._RETRY_DELAY * attempt)
+                        continue
+                else:
+                    series = df["Close"].copy()
+                    series.index = pd.to_datetime(series.index).strftime("%Y-%m-%d")
+                    self.log.debug(
+                        "%s: %d trading days loaded (%s to %s).",
+                        ticker, len(series),
+                        series.index.min(), series.index.max(),
+                    )
+                    break
+            except Exception as exc:
+                self.log.error(
+                    "Error fetching %s (attempt %d/%d): %s",
+                    ticker, attempt, self._MAX_RETRIES, exc,
+                )
+                if attempt < self._MAX_RETRIES:
+                    time.sleep(self._RETRY_DELAY * attempt)
 
         self._history_cache[ticker] = series
         return series
@@ -384,8 +437,20 @@ class PortfolioAnalyser:
         raw_df = self.load_data()
         df     = self.prepare_dataframe(raw_df)
 
-        # 2. Compute metrics
-        self.log.info("Computing metrics…")
+        # 2. Guard: abort cleanly if no rows survived price fetch
+        if df.empty:
+            self.log.error(
+                "DataFrame is empty after price fetch — all rows were skipped. "
+                "This usually means Yahoo Finance blocked every request from this "
+                "IP range. Check the warnings above for per-ticker details. "
+                "Run will be marked as failed."
+            )
+            raise RuntimeError(
+                "No trade data available — cannot compute metrics on empty DataFrame."
+            )
+
+        # 3. Compute metrics
+        self.log.info("Computing metrics...")
 
         ret           = self.total_return(df)
         sharpe_ratio  = self.sharpe(df, RISK_FREE_RATE)
